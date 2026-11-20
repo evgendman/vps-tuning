@@ -1,5 +1,9 @@
 # vps-tuning
 
+## Плагины
+
+- [TorrServer Title v17 для Lampa](plugins/lampa/torrserver-title-v17.js) — плагин отображения состояния торрентов TorrServer, добавления/удаления раздач и отправки данных в Tiramisu.
+
 ## Документация
 
 - [WireGuard на VPS: WG-Easy v15 и доступ к домашней сети](docs/vps-to-keenetic-via-wg-easy.md) — WG-Easy v15.5.0 в host network mode, интерфейс wg1, UDP/443, nftables-изоляция клиентов, автоприменение правил после перезапуска Docker и диагностика.
