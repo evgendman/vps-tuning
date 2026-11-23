@@ -891,6 +891,28 @@ if [[ "$RULE_COUNT" -ne 3 ]]; then
     exit 1
 fi
 
+WG_CONFIG="/opt/edge-gateway/config/wg1.conf"
+if ! sudo grep -Eq '^PostUp[[:space:]]*=.*MASQUERADE' "$WG_CONFIG"; then
+    echo "[ОШИБКА] В wg1.conf отсутствует штатный PostUp с MASQUERADE." >&2
+    exit 1
+fi
+if ! sudo grep -Eq '^PostUp[[:space:]]*=.*--dport 443' "$WG_CONFIG"; then
+    echo "[ОШИБКА] В wg1.conf отсутствует штатный PostUp для UDP/443." >&2
+    exit 1
+fi
+if ! sudo grep -Eq '^PostUp[[:space:]]*=.*-i wg1 .*ACCEPT' "$WG_CONFIG" || \
+   ! sudo grep -Eq '^PostUp[[:space:]]*=.*-o wg1 .*ACCEPT' "$WG_CONFIG"; then
+    echo "[ОШИБКА] В wg1.conf отсутствуют штатные правила PostUp для FORWARD через wg1." >&2
+    exit 1
+fi
+if ! sudo grep -Eq '^PostDown[[:space:]]*=.*MASQUERADE' "$WG_CONFIG" || \
+   ! sudo grep -Eq '^PostDown[[:space:]]*=.*--dport 443' "$WG_CONFIG"; then
+    echo "[ОШИБКА] В wg1.conf отсутствуют штатные PostDown для очистки NAT/UDP." >&2
+    exit 1
+fi
+
+echo "[УСПЕХ] Штатные PostUp/PostDown для NAT, UDP/443 и FORWARD присутствуют."
+
 NETWORK_MODE="$(sudo docker inspect edge-gateway --format '{{.HostConfig.NetworkMode}}')"
 if [[ "$NETWORK_MODE" != "host" ]]; then
     echo "[ОШИБКА] Контейнер должен использовать host network, обнаружено: $NETWORK_MODE" >&2
