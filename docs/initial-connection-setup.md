@@ -464,7 +464,7 @@ echo "[УСПЕХ] Этап 6.1: скрипт правил создан."
 
 ~~~bash
 set -Eeuo pipefail
-trap 'rc=$?; echo "[ОШИБКА] Этап 6.2, код $rc, строка $LINENO' >&2' ERR
+trap 'rc=$?; echo "[ОШИБКА] Этап 6.2, код $rc, строка $LINENO" >&2' ERR
 
 sudo tee /etc/systemd/system/edge-gateway-nft-rules.service >/dev/null <<'EOF'
 [Unit]
