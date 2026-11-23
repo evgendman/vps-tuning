@@ -885,7 +885,7 @@ iptables -t nat -D POSTROUTING -s {{ipv4Cidr}} -o {{device}} -j MASQUERADE; ipta
 
 ~~~bash
 set -Eeuo pipefail
-trap 'rc=$?; echo "[ОШИБКА] Подготовка Hooks, код $rc, строка $LINENO' >&2' ERR
+trap 'rc=$?; echo "[ОШИБКА] Подготовка Hooks, код $rc, строка $LINENO" >&2' ERR
 
 OLD_POSTDOWN_FILE="/opt/edge-gateway/initial-postdown.txt"
 WG_CONFIG_FILE="/opt/edge-gateway/config/wg1.conf"
@@ -1019,6 +1019,11 @@ if sudo grep -Eq '^Post(Up|Down)[[:space:]]*=.*ip6tables' "$WG_CONFIG"; then
 fi
 
 echo "[УСПЕХ] IPv4-only PostUp/PostDown для NAT, UDP/443 и FORWARD присутствуют; IPv6-команд нет."
+
+if sudo test -e /opt/edge-gateway/initial-postdown.txt; then
+    echo "[ОШИБКА] Временный файл initial-postdown.txt не был удалён на этапе 9.3." >&2
+    exit 1
+fi
 
 NETWORK_MODE="$(sudo docker inspect edge-gateway --format '{{.HostConfig.NetworkMode}}')"
 if [[ "$NETWORK_MODE" != "host" ]]; then
