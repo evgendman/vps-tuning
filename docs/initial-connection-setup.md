@@ -933,12 +933,19 @@ if ! sudo grep -Eq '^PostUp[[:space:]]*=.*-i wg1 .*ACCEPT' "$WG_CONFIG" || \
     exit 1
 fi
 if ! sudo grep -Eq '^PostDown[[:space:]]*=.*MASQUERADE' "$WG_CONFIG" || \
-   ! sudo grep -Eq '^PostDown[[:space:]]*=.*--dport 443' "$WG_CONFIG"; then
-    echo "[ОШИБКА] В wg1.conf отсутствуют штатные PostDown для очистки NAT/UDP." >&2
+   ! sudo grep -Eq '^PostDown[[:space:]]*=.*--dport 443' "$WG_CONFIG" || \
+   ! sudo grep -Eq '^PostDown[[:space:]]*=.*-i wg1 .* -D' "$WG_CONFIG" || \
+   ! sudo grep -Eq '^PostDown[[:space:]]*=.*-o wg1 .* -D' "$WG_CONFIG"; then
+    echo "[ОШИБКА] В wg1.conf отсутствуют штатные PostDown для очистки NAT/UDP/FORWARD." >&2
     exit 1
 fi
 
-echo "[УСПЕХ] Штатные PostUp/PostDown для NAT, UDP/443 и FORWARD присутствуют."
+if sudo grep -Eq '^Post(Up|Down)[[:space:]]*=.*ip6tables' "$WG_CONFIG"; then
+    echo "[ОШИБКА] В IPv4-only конфигурации обнаружены IPv6-команды Hooks." >&2
+    exit 1
+fi
+
+echo "[УСПЕХ] IPv4-only PostUp/PostDown для NAT, UDP/443 и FORWARD присутствуют; IPv6-команд нет."
 
 NETWORK_MODE="$(sudo docker inspect edge-gateway --format '{{.HostConfig.NetworkMode}}')"
 if [[ "$NETWORK_MODE" != "host" ]]; then
