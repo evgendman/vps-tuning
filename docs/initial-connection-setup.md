@@ -559,6 +559,7 @@ if [[ ! "$DOMAIN" =~ $DOMAIN_RE ]]; then
     echo "[ОШИБКА] Укажите корректное публичное доменное имя (без схемы https://, порта и пути)." >&2
     exit 1
 fi
+DOMAIN="${DOMAIN,,}"
 
 if [[ -z "$CERT_EMAIL" || "$CERT_EMAIL" != *@* ]]; then
     echo "[ОШИБКА] Указан некорректный e-mail." >&2
@@ -652,6 +653,7 @@ if [[ ! "$DOMAIN" =~ $DOMAIN_RE || ! "$PANEL_USER" =~ ^[A-Za-z0-9._-]{1,64}$ ]];
     echo "[ОШИБКА] Укажите корректный домен и логин из латинских букв, цифр, точки, дефиса или подчёркивания." >&2
     exit 1
 fi
+DOMAIN="${DOMAIN,,}"
 
 if ! sudo test -s "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" || ! sudo test -s "/etc/letsencrypt/live/$DOMAIN/privkey.pem"; then
     echo "[ОШИБКА] Для $DOMAIN не найден сертификат. Повторите этап 7 с тем же доменом." >&2
