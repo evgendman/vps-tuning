@@ -649,7 +649,7 @@ read -r -p "Повторно введите доменное имя панели
 read -r -p "Логин дополнительной Basic Auth: " PANEL_USER
 
 DOMAIN_RE='^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$'
-if [[ ! "$DOMAIN" =~ $DOMAIN_RE || ! "$PANEL_USER" =~ ^[A-Za-z0-9._-]{1,64}$ ]]; then
+if [[ ! "$DOMAIN" =~ $DOMAIN_RE || ! "$PANEL_USER" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; then
     echo "[ОШИБКА] Укажите корректный домен и логин из латинских букв, цифр, точки, дефиса или подчёркивания." >&2
     exit 1
 fi
