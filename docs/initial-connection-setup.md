@@ -1,0 +1,895 @@
+# Первоначальная настройка подключения
+
+**Назначение:** пошаговая установка чистого WG-Easy на новый VPS с Ubuntu 26.04 LTS по схеме, используемой на Дубле.
+
+**Целевая конфигурация:** WG-Easy v15.5.0, Docker host network, интерфейс wg1, WireGuard UDP/443, Web UI на loopback и публикация панели через Nginx HTTPS/TCP 8080 + Basic Auth.
+
+Инструкция рассчитана на VPS, на котором до начала работы установлена только ОС. Она не переносит базу WG-Easy, ключи, настройки или клиентские профили с другого сервера и **не создаёт ни одного пира**.
+
+## 1. Что получится в результате
+
+| Компонент | Настройка |
+|---|---|
+| Compose project / сервис / контейнер | edge-gateway |
+| Образ | ghcr.io/wg-easy/wg-easy:15.5.0 |
+| Сеть контейнера | host |
+| WireGuard-интерфейс | wg1 |
+| Порт WireGuard | UDP/443 |
+| Web UI внутри VPS | 127.0.0.1:51822 |
+| Публичная панель | HTTPS/TCP 8080 через Nginx |
+| Дополнительная защита панели | HTTP Basic Authentication |
+| IPv6 в WG-Easy | отключён |
+| Изоляция пиров | wg1 → wg1 DROP в Docker-USER |
+| Выход VPN-клиентов в Интернет | wg1 → внешний интерфейс VPS; ответный established/related трафик разрешён |
+| Данные WG-Easy | /opt/edge-gateway/config |
+
+Публичный IP, домен, адресный пул VPN, логин и пароли в этом документе не задаются. Их вводят непосредственно на новом VPS.
+
+### Что нужно подготовить до начала
+
+1. Чистый VPS с Ubuntu 26.04 LTS и доступом по SSH через пользователя с sudo.
+2. Публичный IPv4-адрес VPS.
+3. Доменное имя или отдельное поддоменное имя для панели. Его DNS A-запись должна указывать на публичный IP нового VPS.
+4. Доступ к настройкам сетевого экрана у хостинг-провайдера.
+
+На сетевом экране провайдера разрешить входящие соединения:
+
+| Протокол | Порт | Назначение |
+|---|---:|---|
+| TCP | 22 | SSH; если SSH работает на другом порту, открыть именно его |
+| TCP | 80 | получение и проверка сертификата Let's Encrypt |
+| TCP | 8080 | защищённая веб-панель WG-Easy |
+| UDP | 443 | WireGuard |
+
+**Не открывать TCP/51822:** этот порт должен оставаться доступным только локально на самом VPS. TCP/443 для данной конфигурации не требуется: WireGuard использует UDP/443. Если на VPS впоследствии появятся другие HTTPS-сайты, TCP/443 настраивается отдельно.
+
+Для получения сертификата DNS A-запись домена уже должна разрешаться в новый VPS, а входящий TCP/80 должен быть доступен из Интернета. Если домен ещё не подготовлен, сначала выполните DNS-настройку.
+
+Не включайте UFW вслепую. Docker управляет собственными правилами фильтрации; в этой конфигурации правила изоляции добавляются в созданную Docker цепочку DOCKER-USER. Предпочтительно использовать сетевой экран провайдера. Если UFW уже активен, до продолжения отдельно проверьте, что он разрешает SSH, TCP/80, TCP/8080 и UDP/443.
+
+---
+
+## Этап 1. Проверка чистой системы
+
+Выполнять в SSH-сеансе от пользователя с правами sudo. Блок проверяет ОС, архитектуру, наличие sudo и маршрут наружу. Он ничего не меняет.
+
+~~~bash
+set -Eeuo pipefail
+trap 'rc=$?; echo "[ОШИБКА] Этап 1, код $rc, строка $LINENO" >&2' ERR
+
+source /etc/os-release
+
+if [[ "$ID" != "ubuntu" || "$VERSION_ID" != "26.04" ]]; then
+    echo "[ОШИБКА] Требуется Ubuntu 26.04 LTS. Обнаружено: $PRETTY_NAME" >&2
+    exit 1
+fi
+
+if [[ "$(dpkg --print-architecture)" != "amd64" ]]; then
+    echo "[ОШИБКА] Эта инструкция рассчитана на VPS архитектуры amd64." >&2
+    exit 1
+fi
+
+sudo -v
+echo
+echo "ОС: $PRETTY_NAME"
+echo "Архитектура: $(dpkg --print-architecture)"
+echo "Маршрут по умолчанию:"
+ip -4 route show default
+echo
+echo "Состояние UFW:"
+sudo ufw status verbose 2>/dev/null || true
+
+echo "[УСПЕХ] Этап 1: система подходит для установки."
+~~~
+
+Если проверка завершилась ошибкой, дальше не переходить.
+
+## Этап 2. Обновление ОС и установка системных пакетов
+
+Устанавливаются инструменты диагностики, WireGuard, nftables/iptables, Nginx, Certbot и утилита для создания файла Basic Auth.
+
+~~~bash
+set -Eeuo pipefail
+trap 'rc=$?; echo "[ОШИБКА] Этап 2, код $rc, строка $LINENO" >&2' ERR
+
+sudo apt-get update
+sudo DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y
+
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    ca-certificates \
+    curl \
+    gnupg \
+    iproute2 \
+    iptables \
+    nftables \
+    wireguard-tools \
+    kmod \
+    nginx \
+    certbot \
+    apache2-utils \
+    openssl
+
+sudo systemctl enable --now nginx
+
+echo
+echo "Версия Nginx:"
+nginx -v
+echo "Версия iptables:"
+iptables --version
+echo "Версия WireGuard tools:"
+wg --version
+echo "[УСПЕХ] Этап 2: пакеты установлены, Nginx запущен."
+~~~
+
+Ожидается, что iptables использует backend nf_tables (в выводе iptables --version должна присутствовать строка nf_tables). Если указан legacy backend, не продолжать: сначала нужно разобраться с альтернативами iptables на этом VPS.
+
+Если при обновлении ядра был установлен новый kernel, после завершения этапа перезагрузите VPS и продолжите со следующего этапа.
+
+## Этап 3. Установка Docker Engine из официального репозитория
+
+Устанавливается Docker Engine вместе с Compose Plugin. Версия Docker не фиксируется вручную: используется актуальный пакет официального репозитория Docker для Ubuntu 26.04.
+
+~~~bash
+set -Eeuo pipefail
+trap 'rc=$?; echo "[ОШИБКА] Этап 3, код $rc, строка $LINENO" >&2' ERR
+
+source /etc/os-release
+UBUNTU_SUITE="${UBUNTU_CODENAME:-$VERSION_CODENAME}"
+
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+    -o /etc/apt/keyrings/docker.asc
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+
+sudo tee /etc/apt/sources.list.d/docker.sources >/dev/null <<EOF
+Types: deb
+URIs: https://download.docker.com/linux/ubuntu
+Suites: $UBUNTU_SUITE
+Components: stable
+Architectures: $(dpkg --print-architecture)
+Signed-By: /etc/apt/keyrings/docker.asc
+EOF
+
+sudo apt-get update
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    docker-ce \
+    docker-ce-cli \
+    containerd.io \
+    docker-buildx-plugin \
+    docker-compose-plugin
+
+sudo systemctl enable --now docker
+
+sudo docker run --rm hello-world
+sudo docker compose version
+sudo systemctl is-active --quiet docker
+
+echo "[УСПЕХ] Этап 3: Docker Engine и Docker Compose установлены; Docker активен."
+~~~
+
+## Этап 4. Подготовка ядра, маршрутизации и определение внешнего интерфейса
+
+Включается IPv4 forwarding, необходимый для передачи трафика VPN-клиентов через VPS. Модуль WireGuard загружается сейчас и при последующих загрузках ОС.
+
+Внешний интерфейс определяется автоматически по маршруту до Интернета. Это важно: на разных VPS он может называться не eth0, а, например, ens3 или enp1s0.
+
+~~~bash
+set -Eeuo pipefail
+trap 'rc=$?; echo "[ОШИБКА] Этап 4, код $rc, строка $LINENO" >&2' ERR
+
+sudo modprobe wireguard
+
+echo wireguard | sudo tee /etc/modules-load.d/edge-gateway.conf >/dev/null
+
+sudo tee /etc/sysctl.d/99-edge-gateway.conf >/dev/null <<'EOF'
+net.ipv4.ip_forward=1
+EOF
+
+sudo sysctl --load=/etc/sysctl.d/99-edge-gateway.conf
+
+if [[ "$(sysctl -n net.ipv4.ip_forward)" != "1" ]]; then
+    echo "[ОШИБКА] IPv4 forwarding не включился." >&2
+    exit 1
+fi
+
+WAN_IFACE="$(ip -4 route get 1.1.1.1 | awk '{for (i=1; i<=NF; i++) if ($i=="dev") {print $(i+1); exit}}')"
+
+if [[ -z "$WAN_IFACE" || ! -d "/sys/class/net/$WAN_IFACE" ]]; then
+    echo "[ОШИБКА] Не удалось определить внешний сетевой интерфейс VPS." >&2
+    exit 1
+fi
+
+printf 'WAN_IFACE=%s\n' "$WAN_IFACE" | sudo tee /etc/default/edge-gateway-nft-rules >/dev/null
+sudo chmod 644 /etc/default/edge-gateway-nft-rules
+
+echo "WireGuard kernel module: загружен"
+echo "IPv4 forwarding: $(sysctl -n net.ipv4.ip_forward)"
+echo "Внешний интерфейс VPS: $WAN_IFACE"
+echo "[УСПЕХ] Этап 4: ядро и маршрутизация подготовлены."
+~~~
+
+Запишите название внешнего интерфейса, выведенное в конце. Оно будет использовано при проверке настройки панели. В дальнейшем не подставляйте eth0 автоматически — ориентируйтесь на определённое системой значение.
+
+## Этап 5. Создание и запуск WG-Easy
+
+Создаётся каталог /opt/edge-gateway. В Compose намеренно не указываются публичный IP и VPN-адреса: публичный адрес будет задан в мастере первоначальной настройки WG-Easy.
+
+~~~bash
+set -Eeuo pipefail
+trap 'rc=$?; echo "[ОШИБКА] Этап 5, код $rc, строка $LINENO" >&2' ERR
+
+sudo install -d -o root -g root -m 0750 /opt/edge-gateway
+sudo install -d -o root -g root -m 0700 /opt/edge-gateway/config
+
+sudo tee /opt/edge-gateway/compose.yaml >/dev/null <<'EOF'
+name: edge-gateway
+
+services:
+  edge-gateway:
+    image: ghcr.io/wg-easy/wg-easy:15.5.0
+    container_name: edge-gateway
+    restart: unless-stopped
+    network_mode: host
+
+    environment:
+      HOST: "127.0.0.1"
+      PORT: "51822"
+      INSECURE: "false"
+      DISABLE_IPV6: "true"
+      TRUSTED_PROXIES: "127.0.0.1"
+      WG_INTERFACE: "wg1"
+
+    volumes:
+      - ./config:/etc/wireguard
+      - /lib/modules:/lib/modules:ro
+
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+EOF
+
+sudo chmod 640 /opt/edge-gateway/compose.yaml
+
+sudo docker compose --project-directory /opt/edge-gateway \
+    -f /opt/edge-gateway/compose.yaml config --quiet
+sudo docker compose --project-directory /opt/edge-gateway \
+    -f /opt/edge-gateway/compose.yaml pull
+sudo docker compose --project-directory /opt/edge-gateway \
+    -f /opt/edge-gateway/compose.yaml up -d
+
+sleep 5
+
+CONTAINER_STATE="$(sudo docker inspect edge-gateway --format '{{.State.Status}}')"
+
+if [[ "$CONTAINER_STATE" != "running" ]]; then
+    sudo docker logs --tail 100 edge-gateway
+    echo "[ОШИБКА] Контейнер edge-gateway не находится в состоянии running." >&2
+    exit 1
+fi
+
+if ! sudo ss -lntp | grep -q '127.0.0.1:51822'; then
+    sudo docker logs --tail 100 edge-gateway
+    echo "[ОШИБКА] Web UI не слушает 127.0.0.1:51822." >&2
+    exit 1
+fi
+
+HTTP_CODE="$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:51822/)"
+if [[ ! "$HTTP_CODE" =~ ^(200|30[0-9])$ ]]; then
+    echo "[ОШИБКА] Web UI вернул HTTP $HTTP_CODE." >&2
+    exit 1
+fi
+
+echo "Контейнер: $CONTAINER_STATE"
+echo "Локальный Web UI: HTTP $HTTP_CODE на 127.0.0.1:51822"
+echo "[УСПЕХ] Этап 5: WG-Easy v15.5.0 запущен."
+~~~
+
+На этом этапе Web UI должен быть доступен только через loopback. Не публикуйте TCP/51822 в сетевом экране провайдера и не меняйте HOST на 0.0.0.0.
+
+Проверить конфигурацию контейнера можно командой:
+
+~~~bash
+sudo docker inspect edge-gateway \
+  --format 'network={{.HostConfig.NetworkMode}} restart={{.HostConfig.RestartPolicy.Name}}'
+~~~
+
+Ожидается network=host и restart=unless-stopped.
+
+## Этап 6. Изоляция пиров и правила пересылки трафика
+
+Этот этап воспроизводит три правила, используемые на Дубле:
+
+1. wg1 → wg1 — DROP: пиры не могут обмениваться трафиком друг с другом через сервер.
+2. Внешний интерфейс VPS → wg1 — ACCEPT только для established/related: разрешены ответные пакеты уже установленных соединений.
+3. wg1 → внешний интерфейс VPS — ACCEPT: VPN-клиенты могут отправлять трафик в Интернет через VPS.
+
+Правила добавляются в Docker-цепочку DOCKER-USER. Они не открывают произвольную пересылку между остальными интерфейсами.
+
+### 6.1. Создание скрипта правил
+
+Скрипт умеет применять и удалять только собственные правила с комментариями edge-gateway-wg1-*. Повторный запуск apply не создаёт дубликаты.
+
+~~~bash
+set -Eeuo pipefail
+trap 'rc=$?; echo "[ОШИБКА] Этап 6.1, код $rc, строка $LINENO" >&2' ERR
+
+sudo tee /usr/local/sbin/edge-gateway-nft-rules >/dev/null <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ENV_FILE="/etc/default/edge-gateway-nft-rules"
+CHAIN_FAMILY="ip"
+CHAIN_TABLE="filter"
+CHAIN_NAME="DOCKER-USER"
+COMMENT_PREFIX="edge-gateway-wg1"
+
+if [[ ! -r "$ENV_FILE" ]]; then
+    echo "Не найден $ENV_FILE" >&2
+    exit 1
+fi
+
+# Файл создаётся root во время установки.
+source "$ENV_FILE"
+
+if [[ -z "${WAN_IFACE:-}" ]]; then
+    echo "В $ENV_FILE не задан WAN_IFACE" >&2
+    exit 1
+fi
+
+chain_exists() {
+    nft list chain "$CHAIN_FAMILY" "$CHAIN_TABLE" "$CHAIN_NAME" >/dev/null 2>&1
+}
+
+wait_for_chain() {
+    for attempt in $(seq 1 60); do
+        if chain_exists; then
+            return 0
+        fi
+        sleep 1
+    done
+
+    echo "Не появилась цепочка ip filter DOCKER-USER. Проверьте Docker и iptables backend." >&2
+    exit 1
+}
+
+remove_rules() {
+    if ! chain_exists; then
+        return 0
+    fi
+
+    while IFS= read -r handle; do
+        if [[ -n "$handle" ]]; then
+            nft delete rule "$CHAIN_FAMILY" "$CHAIN_TABLE" "$CHAIN_NAME" handle "$handle"
+        fi
+    done < <(
+        nft -a list chain "$CHAIN_FAMILY" "$CHAIN_TABLE" "$CHAIN_NAME" |
+        awk -v prefix="$COMMENT_PREFIX-" '
+            index($0, "comment \"" prefix) {
+                for (i = 1; i <= NF; i++) {
+                    if ($i == "handle") {
+                        print $(i + 1)
+                    }
+                }
+            }
+        '
+    )
+}
+
+apply_rules() {
+    wait_for_chain
+
+    if [[ ! -d "/sys/class/net/$WAN_IFACE" ]]; then
+        echo "Сетевой интерфейс $WAN_IFACE не существует" >&2
+        exit 1
+    fi
+
+    remove_rules
+
+    nft add rule ip filter DOCKER-USER \
+        iifname "wg1" oifname "wg1" \
+        counter drop comment "edge-gateway-wg1-peer-isolation"
+
+    nft add rule ip filter DOCKER-USER \
+        iifname "$WAN_IFACE" oifname "wg1" \
+        ct state established,related counter accept \
+        comment "edge-gateway-wg1-return"
+
+    nft add rule ip filter DOCKER-USER \
+        iifname "wg1" oifname "$WAN_IFACE" \
+        counter accept comment "edge-gateway-wg1-egress"
+
+    echo "Правила edge-gateway применены."
+}
+
+case "${1:-}" in
+    apply)
+        apply_rules
+        ;;
+    remove)
+        remove_rules
+        echo "Правила edge-gateway удалены."
+        ;;
+    *)
+        echo "Использование: $0 apply|remove" >&2
+        exit 2
+        ;;
+esac
+EOF
+
+sudo chown root:root /usr/local/sbin/edge-gateway-nft-rules
+sudo chmod 750 /usr/local/sbin/edge-gateway-nft-rules
+
+echo "[УСПЕХ] Этап 6.1: скрипт правил создан."
+~~~
+
+### 6.2. Создание systemd-службы
+
+Служба применяет правила после запуска Docker. При остановке Docker она удаляет только свои правила, а при последующем запуске Docker применяет их заново.
+
+~~~bash
+set -Eeuo pipefail
+trap 'rc=$?; echo "[ОШИБКА] Этап 6.2, код $rc, строка $LINENO" >&2' ERR
+
+sudo tee /etc/systemd/system/edge-gateway-nft-rules.service >/dev/null <<'EOF'
+[Unit]
+Description=Edge Gateway WireGuard forwarding and peer isolation rules
+Wants=docker.service
+After=docker.service
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/edge-gateway-nft-rules apply
+ExecStop=/usr/local/sbin/edge-gateway-nft-rules remove
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now edge-gateway-nft-rules.service
+
+sudo systemctl is-enabled --quiet edge-gateway-nft-rules.service
+sudo systemctl is-active --quiet edge-gateway-nft-rules.service
+
+sudo nft -a list chain ip filter DOCKER-USER
+
+RULE_COUNT="$(sudo nft -a list chain ip filter DOCKER-USER | grep -c 'edge-gateway-wg1-' || true)"
+if [[ "$RULE_COUNT" -ne 3 ]]; then
+    echo "[ОШИБКА] Ожидалось 3 правила edge-gateway, обнаружено: $RULE_COUNT" >&2
+    exit 1
+fi
+
+echo "[УСПЕХ] Этап 6.2: systemd-служба активна, все три правила установлены."
+~~~
+
+Если этап завершился ошибкой, не заменяйте правила широкими ACCEPT. Сначала проверьте наличие цепочки и backend:
+
+~~~bash
+sudo iptables --version
+sudo iptables -S DOCKER-USER
+sudo systemctl status docker --no-pager
+sudo journalctl -u edge-gateway-nft-rules.service -n 100 --no-pager
+~~~
+
+## Этап 7. Подготовка домена и получение TLS-сертификата
+
+Панель будет опубликована по HTTPS на TCP/8080. Сначала Nginx на TCP/80 обслужит только проверку Let's Encrypt, затем для панели будет включён отдельный HTTPS server block.
+
+Перед выполнением убедитесь, что:
+
+- A-запись домена указывает на публичный IP именно нового VPS;
+- входящий TCP/80 разрешён у провайдера;
+- Nginx запущен.
+
+~~~bash
+set -Eeuo pipefail
+trap 'rc=$?; echo "[ОШИБКА] Этап 7, код $rc, строка $LINENO" >&2' ERR
+
+read -r -p "Доменное имя панели (например, vpn.example.net): " DOMAIN
+read -r -p "Контактный e-mail для Let's Encrypt: " CERT_EMAIL
+
+if [[ -z "$DOMAIN" || "$DOMAIN" != *.* || "$DOMAIN" == *" "* ]]; then
+    echo "[ОШИБКА] Указано некорректное доменное имя." >&2
+    exit 1
+fi
+
+if [[ -z "$CERT_EMAIL" || "$CERT_EMAIL" != *@* ]]; then
+    echo "[ОШИБКА] Указан некорректный e-mail." >&2
+    exit 1
+fi
+
+if ! getent ahostsv4 "$DOMAIN" >/dev/null; then
+    echo "[ОШИБКА] Домен пока не разрешается в IPv4. Проверьте DNS A-запись." >&2
+    exit 1
+fi
+
+echo
+echo "IPv4-адреса, в которые сейчас разрешается домен:"
+getent ahostsv4 "$DOMAIN" | awk '{print $1}' | sort -u
+
+echo
+echo "Сверьте показанные адреса с публичным IP нового VPS."
+read -r -p "DNS A-запись проверена и указывает на этот VPS? Введите YES: " DNS_CONFIRMED
+
+if [[ "$DNS_CONFIRMED" != "YES" ]]; then
+    echo "[ОШИБКА] Сначала исправьте DNS и повторите этап 7." >&2
+    exit 1
+fi
+
+sudo install -d -m 0755 /var/www/letsencrypt/.well-known/acme-challenge
+
+sudo tee /etc/nginx/sites-available/edge-gateway-panel >/dev/null <<EOF
+server {
+    listen 80;
+    server_name $DOMAIN;
+
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/letsencrypt;
+        default_type text/plain;
+        try_files \$uri =404;
+    }
+
+    location / {
+        return 404;
+    }
+}
+EOF
+
+sudo ln -sfn /etc/nginx/sites-available/edge-gateway-panel \
+    /etc/nginx/sites-enabled/edge-gateway-panel
+
+sudo nginx -t
+sudo systemctl enable --now nginx
+sudo systemctl reload nginx
+
+sudo certbot certonly \
+    --webroot \
+    --webroot-path /var/www/letsencrypt \
+    --domain "$DOMAIN" \
+    --email "$CERT_EMAIL" \
+    --agree-tos \
+    --no-eff-email \
+    --non-interactive
+
+sudo test -s "/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
+sudo test -s "/etc/letsencrypt/live/$DOMAIN/privkey.pem"
+
+echo "[УСПЕХ] Этап 7: сертификат для $DOMAIN получен."
+~~~
+
+Если Certbot завершился ошибкой, не переходите к следующему этапу. Чаще всего причина — DNS ещё не обновился, указан не тот IP или входящий TCP/80 закрыт у провайдера.
+
+## Этап 8. Публикация панели на TCP/8080 и Basic Auth
+
+Создаётся отдельная учётная запись Basic Auth. Это дополнительный пароль Nginx; он не заменяет логин и пароль WG-Easy.
+
+~~~bash
+set -Eeuo pipefail
+trap 'rc=$?; echo "[ОШИБКА] Этап 8, код $rc, строка $LINENO" >&2' ERR
+
+read -r -p "Повторно введите доменное имя панели: " DOMAIN
+read -r -p "Логин дополнительной Basic Auth: " PANEL_USER
+
+if [[ -z "$DOMAIN" || "$DOMAIN" != *.* || -z "$PANEL_USER" ]]; then
+    echo "[ОШИБКА] Домен и логин должны быть заданы." >&2
+    exit 1
+fi
+
+if sudo test -f /etc/nginx/.htpasswd-wgeasy; then
+    sudo htpasswd -B /etc/nginx/.htpasswd-wgeasy "$PANEL_USER"
+else
+    sudo htpasswd -cB /etc/nginx/.htpasswd-wgeasy "$PANEL_USER"
+fi
+
+sudo chown root:www-data /etc/nginx/.htpasswd-wgeasy
+sudo chmod 640 /etc/nginx/.htpasswd-wgeasy
+
+sudo tee /etc/nginx/sites-available/edge-gateway-panel >/dev/null <<EOF
+server {
+    listen 80;
+    server_name $DOMAIN;
+
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/letsencrypt;
+        default_type text/plain;
+        try_files \$uri =404;
+    }
+
+    location / {
+        return 404;
+    }
+}
+
+server {
+    listen 8080 ssl;
+    server_name $DOMAIN;
+
+    ssl_certificate     /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    auth_basic "WG-Easy";
+    auth_basic_user_file /etc/nginx/.htpasswd-wgeasy;
+
+    location / {
+        proxy_pass http://127.0.0.1:51822;
+        proxy_http_version 1.1;
+
+        proxy_set_header Host              \$http_host;
+        proxy_set_header X-Real-IP         \$remote_addr;
+        proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Host  \$http_host;
+        proxy_set_header X-Forwarded-Port  \$server_port;
+        proxy_set_header X-Forwarded-Proto https;
+
+        proxy_read_timeout 300s;
+    }
+}
+EOF
+
+sudo nginx -t
+sudo systemctl reload nginx
+
+PANEL_HTTP_CODE="$(curl -k -sS -o /dev/null -w '%{http_code}' \
+    --resolve "$DOMAIN:8080:127.0.0.1" "https://$DOMAIN:8080/")"
+
+if [[ "$PANEL_HTTP_CODE" != "401" ]]; then
+    echo "[ОШИБКА] Ожидался HTTP 401 от Basic Auth, получен HTTP $PANEL_HTTP_CODE." >&2
+    exit 1
+fi
+
+echo "[УСПЕХ] Этап 8: Nginx слушает HTTPS/TCP 8080; Basic Auth отвечает HTTP 401 без пароля."
+~~~
+
+HTTP 401 в последней проверке — ожидаемый результат: Nginx требует дополнительную авторизацию, прежде чем передать запрос в WG-Easy.
+
+### 8.1. Автоматическое обновление сертификата
+
+После продления сертификата Nginx должен перечитать новые файлы.
+
+~~~bash
+set -Eeuo pipefail
+trap 'rc=$?; echo "[ОШИБКА] Этап 8.1, код $rc, строка $LINENO" >&2' ERR
+
+sudo install -d -m 0755 /etc/letsencrypt/renewal-hooks/deploy
+
+sudo tee /etc/letsencrypt/renewal-hooks/deploy/edge-gateway-reload-nginx >/dev/null <<'EOF'
+#!/bin/sh
+systemctl reload nginx
+EOF
+
+sudo chmod 750 /etc/letsencrypt/renewal-hooks/deploy/edge-gateway-reload-nginx
+
+sudo systemctl enable --now certbot.timer
+sudo certbot renew --dry-run
+sudo systemctl is-active --quiet certbot.timer
+
+echo "[УСПЕХ] Этап 8.1: таймер Certbot активен, тестовое продление выполнено."
+~~~
+
+## Этап 9. Первоначальная настройка через веб-интерфейс
+
+Откройте в браузере:
+
+~~~text
+https://<ДОМЕН_ПАНЕЛИ>:8080
+~~~
+
+Сначала браузер запросит логин и пароль Nginx Basic Auth — те, которые были заданы на этапе 8. После этого откроется мастер WG-Easy.
+
+### 9.1. Первичное создание учётной записи WG-Easy
+
+1. Укажите имя пользователя администратора WG-Easy.
+2. Установите отдельный сложный пароль и повторите его.
+3. На вопрос об использовании существующей конфигурации выберите **No** — это новая установка, не импорт старой базы.
+4. В поле Host укажите публичный IP нового VPS или его доменное имя.
+5. В поле Port укажите **443**.
+
+Не вводите адрес старого VPS. Значение Host должно соответствовать новому серверу.
+
+### 9.2. Общие параметры WG-Easy
+
+Откройте меню пользователя в правом верхнем углу → **Admin Panel**.
+
+#### Config
+
+Проверьте следующие параметры:
+
+| Поле | Что установить |
+|---|---|
+| Host | Публичный IP или домен нового VPS |
+| Port | 443 |
+| Allowed IPs | 0.0.0.0/0 |
+| DNS | Те же DNS-серверы, что используются на Дубле, либо выбранные вами доверенные резолверы |
+| Generate Preshared Keys | Enabled |
+| MTU | Оставить пустым для автоматического определения |
+| Persistent Keepalive | Оставить значение по умолчанию; особое значение задавать только при необходимости для конкретного клиента |
+
+Для данной конфигурации в Allowed IPs не добавлять ::/0: IPv6 в WG-Easy отключён. Значение 0.0.0.0/0 задаёт full-tunnel для IPv4-клиентов.
+
+Host и Port — это публичные параметры подключения, включаемые в генерируемые клиентские конфигурации. Они не заменяют настройки серверного интерфейса.
+
+#### Interface
+
+Проверьте:
+
+| Поле | Что установить |
+|---|---|
+| Port | 443 |
+| Device | Внешний интерфейс VPS, определённый на этапе 4 |
+| MTU | Оставить пустым для автоматического определения |
+| Routing Table | auto |
+| Per-Client Firewall | Не включать для воспроизведения текущей схемы Дубля |
+
+Device должен совпадать со значением WAN_IFACE в файле /etc/default/edge-gateway-nft-rules. Например, если на этапе 4 было определено ens3, в поле Device укажите ens3, а не eth0.
+
+VPN CIDR (адресный пул интерфейса) должен быть частным IPv4-подсетью, не пересекающейся с сетями, доступ к которым будет нужен через VPN. Не выбирайте адресный диапазон наугад, если уже есть маршрутизируемые частные сети. Само значение CIDR в публичный репозиторий не записывается.
+
+Функция Per-Client Firewall в WG-Easy — отдельный экспериментальный механизм фильтрации конкретных клиентов. Она не заменяет три правила DOCKER-USER, установленные на этапе 6. Для повторения схемы Дубля оставьте её выключенной.
+
+#### General и Hooks
+
+- Не включайте Prometheus/JSON metrics, если нет отдельной задачи собирать эти метрики.
+- Session Timeout можно оставить со значением по умолчанию.
+- В Hooks не добавляйте команды и не меняйте значения без отдельной необходимости.
+
+После изменения формы нажмите **Save**. Если интерфейс предлагает отдельную перезагрузку WireGuard Interface после изменения сетевых параметров, выполните её. Клиентов на этом этапе создавать не нужно.
+
+Официальное руководство WG-Easy v15.5.0 по расположению этих пунктов: [Admin Panel](https://wg-easy.github.io/wg-easy/v15.5/guides/admin/).
+
+## Этап 10. Итоговая проверка
+
+Выполнять после завершения мастера WG-Easy и сохранения параметров Interface.
+
+~~~bash
+set -Eeuo pipefail
+trap 'rc=$?; echo "[ОШИБКА] Этап 10, код $rc, строка $LINENO" >&2' ERR
+
+sudo docker compose --project-directory /opt/edge-gateway \
+    -f /opt/edge-gateway/compose.yaml config --quiet
+sudo docker compose --project-directory /opt/edge-gateway \
+    -f /opt/edge-gateway/compose.yaml ps
+
+sudo systemctl is-active --quiet docker
+sudo systemctl is-enabled --quiet edge-gateway-nft-rules.service
+sudo systemctl is-active --quiet edge-gateway-nft-rules.service
+sudo systemctl is-active --quiet nginx
+sudo systemctl is-enabled --quiet certbot.timer
+
+echo
+echo "WireGuard interface:"
+sudo docker exec edge-gateway wg show wg1 listen-port
+sudo ip -brief address show wg1
+
+WG_PORT="$(sudo docker exec edge-gateway wg show wg1 listen-port)"
+if [[ "$WG_PORT" != "443" ]]; then
+    echo "[ОШИБКА] WireGuard должен слушать UDP/443, фактически: $WG_PORT" >&2
+    exit 1
+fi
+
+echo
+echo "Firewall rules:"
+sudo nft -a list chain ip filter DOCKER-USER
+
+RULE_COUNT="$(sudo nft -a list chain ip filter DOCKER-USER | grep -c 'edge-gateway-wg1-' || true)"
+if [[ "$RULE_COUNT" -ne 3 ]]; then
+    echo "[ОШИБКА] Ожидалось 3 правила изоляции/пересылки, обнаружено: $RULE_COUNT" >&2
+    exit 1
+fi
+
+echo
+echo "Проверка локального Web UI:"
+sudo ss -lntp | grep '127.0.0.1:51822'
+
+echo
+echo "Проверка внешнего HTTPS listener:"
+sudo ss -lntp | grep ':8080'
+
+echo
+echo "IPv4 forwarding: $(sysctl -n net.ipv4.ip_forward)"
+echo "[УСПЕХ] Этап 10: основные компоненты установлены и проверки пройдены."
+~~~
+
+В результате должны выполняться все условия:
+
+- контейнер edge-gateway работает и использует host network;
+- интерфейс wg1 существует и слушает UDP/443;
+- Web UI слушает только 127.0.0.1:51822;
+- Nginx принимает HTTPS на TCP/8080;
+- без Basic Auth панель отвечает HTTP 401;
+- IPv4 forwarding включён;
+- в DOCKER-USER присутствуют три правила с комментариями edge-gateway-wg1-*;
+- служба edge-gateway-nft-rules включена в автозапуск;
+- Certbot timer активен.
+
+На чистом сервере в списке WG-Easy пока не должно быть созданных клиентских пиров.
+
+## Этап 11. Проверка восстановления после перезагрузки
+
+Перезагрузите VPS:
+
+~~~bash
+sudo reboot
+~~~
+
+После повторного подключения по SSH выполните:
+
+~~~bash
+set -Eeuo pipefail
+trap 'rc=$?; echo "[ОШИБКА] Этап 11, код $rc, строка $LINENO" >&2' ERR
+
+sudo systemctl is-active --quiet docker
+sudo systemctl is-active --quiet nginx
+sudo systemctl is-active --quiet edge-gateway-nft-rules.service
+sudo systemctl is-active --quiet certbot.timer
+
+sudo docker inspect edge-gateway --format '{{.State.Status}}'
+sudo docker exec edge-gateway wg show wg1 listen-port
+sudo nft -a list chain ip filter DOCKER-USER
+
+RULE_COUNT="$(sudo nft -a list chain ip filter DOCKER-USER | grep -c 'edge-gateway-wg1-' || true)"
+if [[ "$RULE_COUNT" -ne 3 ]]; then
+    echo "[ОШИБКА] После перезагрузки не восстановились все три firewall-правила." >&2
+    exit 1
+fi
+
+echo "[УСПЕХ] Этап 11: Docker, WG-Easy, Nginx и firewall-служба восстановились после перезагрузки."
+~~~
+
+## Диагностика при неудаче
+
+### WG-Easy
+
+~~~bash
+sudo docker compose -f /opt/edge-gateway/compose.yaml ps
+sudo docker logs --tail 150 edge-gateway
+sudo docker inspect edge-gateway --format '{{.State.Status}} {{.State.Health.Status}}'
+sudo docker exec edge-gateway wg show wg1
+~~~
+
+### Firewall и маршрутизация
+
+~~~bash
+sudo systemctl status edge-gateway-nft-rules.service --no-pager
+sudo journalctl -u edge-gateway-nft-rules.service -b --no-pager
+sudo nft -a list chain ip filter DOCKER-USER
+ip -4 route show default
+sysctl net.ipv4.ip_forward
+~~~
+
+### Nginx и сертификат
+
+~~~bash
+sudo nginx -t
+sudo systemctl status nginx --no-pager
+sudo journalctl -u nginx -n 100 --no-pager
+sudo certbot certificates
+sudo systemctl status certbot.timer --no-pager
+~~~
+
+Не публикуйте вывод wg show целиком, содержимое базы WG-Easy, клиентские конфигурации, ключи, пароли или резервные копии.
+
+## Важные замечания
+
+1. Не изменяйте вручную /opt/edge-gateway/config/wg1.conf. Конфигурацией интерфейса и клиентов управляет WG-Easy.
+2. Не меняйте имя интерфейса wg1, порт UDP/443, HOST/PORT Web UI и TRUSTED_PROXIES без одновременной проверки зависимых настроек.
+3. Не открывайте TCP/51822 во внешнем сетевом экране. Доступ к панели должен идти через Nginx на TCP/8080.
+4. Не удаляйте правила DOCKER-USER вручную. Для удаления только правил этого помощника используйте команду:
+
+   ~~~bash
+   sudo /usr/local/sbin/edge-gateway-nft-rules remove
+   ~~~
+
+5. Файл /opt/edge-gateway/config/wg-easy.db и остальные данные каталога config содержат закрытые ключи и чувствительные настройки. Резервные копии хранить только локально или в защищённом частном хранилище. Не загружать их в GitHub.
+6. В репозитории сохраняются только шаблоны и документация. Реальные IP-адреса, домен, VPN CIDR, логины, пароли, ключи и данные пиров в него не добавлять.
+
+## Источники
+
+- [WG-Easy v15.5.0 — Setup](https://wg-easy.github.io/wg-easy/v15.5/guides/setup/)
+- [WG-Easy v15.5.0 — Optional Configuration](https://wg-easy.github.io/wg-easy/v15.5/advanced/config/optional-config/)
+- [WG-Easy v15.5.0 — Admin Panel](https://wg-easy.github.io/wg-easy/v15.5/guides/admin/)
+- [Docker Engine — установка на Ubuntu](https://docs.docker.com/engine/install/ubuntu/)
+- [Документация этого репозитория — серверная схема WG-Easy](vps-to-keenetic-via-wg-easy.md)
+- [Документация этого репозитория — HTTPS, Nginx и порт панели](vps-media-services-https.md)
