@@ -390,7 +390,7 @@ fi
 
 source "$ENV_FILE"
 
-if [[ -z "$WAN_IFACE" ]]; then
+if [[ -z "${WAN_IFACE:-}" ]]; then
     echo "В $ENV_FILE не задан WAN_IFACE" >&2
     exit 1
 fi
@@ -559,6 +559,8 @@ echo "[УСПЕХ] Цепочка ip filter DOCKER-USER существует и 
 ~~~
 
 При диагностике учитывайте, что Docker использует цепочку DOCKER-USER в режиме iptables. Ожидается backend nf_tables у iptables, как на Дубле. Не переключайте Docker на native nftables backend и не отключайте его управление iptables.
+
+**Особенность этой схемы:** helper намеренно использует команду nft для вставки правил в цепочку DOCKER-USER, созданную Docker через совместимый iptables-nft backend, — именно так сделано на Дубле. Это проверенная для текущей конфигурации реализация, но не общий рекомендованный Docker способ: официальная документация Docker рекомендует управлять правилами через iptables/ip6tables и предупреждает о неподдерживаемости произвольных nft rulesets. Поэтому не переносите этот helper на другой Docker firewall backend и после обновления Docker повторно проверяйте DOCKER-USER. Переход на iptables-native helper возможен отдельно, но это уже будет изменение реализации относительно Дубля.
 
 Проверить backend можно так:
 
@@ -1160,5 +1162,8 @@ sudo systemctl status certbot.timer --no-pager
 - [Docker Engine — установка на Ubuntu](https://docs.docker.com/engine/install/ubuntu/)
 - [Docker — bridge networking](https://docs.docker.com/engine/network/drivers/bridge/)
 - [Docker — iptables и цепочка DOCKER-USER](https://docs.docker.com/engine/network/firewall-iptables/)
+- [Docker — ограничения firewall](https://docs.docker.com/engine/install/ubuntu/#firewall-limitations)
+- [WireGuard — wg-quick(8), PostUp/PostDown](https://man7.org/linux/man-pages/man8/wg-quick.8.html)
+- [Исходный код WG-Easy v15.5.0 — начальная БД и отключение IPv6 Hooks](https://github.com/wg-easy/wg-easy/blob/v15.5.0/src/server/database/sqlite.ts)
 - [Документация этого репозитория — серверная схема WG-Easy](vps-to-keenetic-via-wg-easy.md)
 - [Документация этого репозитория — HTTPS, Nginx и порт панели](vps-media-services-https.md)
