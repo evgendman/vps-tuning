@@ -59,6 +59,11 @@ trap 'rc=$?; echo "[ОШИБКА] Этап 1, код $rc, строка $LINENO" 
 
 source /etc/os-release
 
+if [[ "$EUID" -eq 0 ]]; then
+    echo "[ОШИБКА] Запустите блок от обычного пользователя с sudo, не из root-shell." >&2
+    exit 1
+fi
+
 if [[ "$ID" != "ubuntu" || "$VERSION_ID" != "26.04" ]]; then
     echo "[ОШИБКА] Требуется Ubuntu 26.04 LTS. Обнаружено: $PRETTY_NAME" >&2
     exit 1
@@ -107,7 +112,8 @@ sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
     nginx \
     certbot \
     apache2-utils \
-    openssl
+    openssl \
+    python3
 
 sudo systemctl enable --now nginx
 
@@ -295,19 +301,21 @@ sudo docker inspect edge-gateway \
 
 Ожидается network=host и restart=unless-stopped.
 
-## Этап 6. Изоляция пиров и правила пересылки трафика
+## Этап 6. Подготовка изоляции пиров и правил пересылки
 
-Этот этап воспроизводит три правила, используемые на Дубле:
+Этот этап создаёт скрипт и systemd-службу. Сама служба будет включена **после** первоначального мастера WG-Easy, когда появится интерфейс wg1 и его IPv4-подсеть.
 
-1. wg1 → wg1 — DROP: пиры не могут обмениваться трафиком друг с другом через сервер.
-2. Внешний интерфейс VPS → wg1 — ACCEPT только для established/related: разрешены ответные пакеты уже установленных соединений.
-3. wg1 → внешний интерфейс VPS — ACCEPT: VPN-клиенты могут отправлять трафик в Интернет через VPS.
+Схема повторяет Дубль:
 
-Правила добавляются в Docker-цепочку DOCKER-USER. Они не открывают произвольную пересылку между остальными интерфейсами.
+1. wg1 → wg1 — DROP для трафика между адресами VPN-подсети: пиры изолированы друг от друга.
+2. Внешний интерфейс VPS → wg1 — ACCEPT только для established,related и только к адресу VPN-подсети.
+3. wg1 → внешний интерфейс VPS — ACCEPT только от адресов VPN-подсети.
+
+Правила устанавливаются через nft в цепочку ip filter DOCKER-USER и вставляются в начало цепочки (insert), чтобы они обрабатывались до последующих правил Docker. Обычный add для этой задачи не подходит: правило может оказаться за завершающим RETURN и не сработать.
+
+В новой установке адрес VPN-подсети не зашивается в скрипт. После создания wg1 он будет считан с самого интерфейса, а затем преобразован в сетевой CIDR. Внешний интерфейс VPS берётся из /etc/default/edge-gateway-nft-rules, сформированного на этапе 4.
 
 ### 6.1. Создание скрипта правил
-
-Скрипт умеет применять и удалять только собственные правила с комментариями edge-gateway-wg1-*. Повторный запуск apply не создаёт дубликаты.
 
 ~~~bash
 set -Eeuo pipefail
@@ -318,99 +326,127 @@ sudo tee /usr/local/sbin/edge-gateway-nft-rules >/dev/null <<'EOF'
 set -Eeuo pipefail
 
 ENV_FILE="/etc/default/edge-gateway-nft-rules"
+WG_INTERFACE="wg1"
 CHAIN_FAMILY="ip"
 CHAIN_TABLE="filter"
 CHAIN_NAME="DOCKER-USER"
-COMMENT_PREFIX="edge-gateway-wg1"
+
+EGRESS_COMMENT="edge-gateway-wg1-egress"
+RETURN_COMMENT="edge-gateway-wg1-return"
+ISOLATION_COMMENT="edge-gateway-wg1-peer-isolation"
 
 if [[ ! -r "$ENV_FILE" ]]; then
     echo "Не найден $ENV_FILE" >&2
     exit 1
 fi
 
-# Файл создаётся root во время установки.
 source "$ENV_FILE"
 
-if [[ -z "${WAN_IFACE:-}" ]]; then
+if [[ -z "$WAN_IFACE" ]]; then
     echo "В $ENV_FILE не задан WAN_IFACE" >&2
     exit 1
 fi
 
-chain_exists() {
-    nft list chain "$CHAIN_FAMILY" "$CHAIN_TABLE" "$CHAIN_NAME" >/dev/null 2>&1
-}
-
 wait_for_chain() {
-    for attempt in $(seq 1 60); do
-        if chain_exists; then
+    for _ in $(seq 1 60); do
+        if nft list chain "$CHAIN_FAMILY" "$CHAIN_TABLE" "$CHAIN_NAME" >/dev/null 2>&1; then
             return 0
         fi
         sleep 1
     done
 
-    echo "Не появилась цепочка ip filter DOCKER-USER. Проверьте Docker и iptables backend." >&2
-    exit 1
+    echo "Цепочка ip filter DOCKER-USER не появилась. Проверьте Docker и iptables backend." >&2
+    return 1
 }
 
-remove_rules() {
-    if ! chain_exists; then
-        return 0
-    fi
+get_wg_network() {
+    local address
 
-    while IFS= read -r handle; do
-        if [[ -n "$handle" ]]; then
-            nft delete rule "$CHAIN_FAMILY" "$CHAIN_TABLE" "$CHAIN_NAME" handle "$handle"
+    for _ in $(seq 1 60); do
+        if [[ -d "/sys/class/net/$WG_INTERFACE" ]]; then
+            address="$(ip -4 -o address show dev "$WG_INTERFACE" scope global | awk 'NR == 1 {print $4}')"
+            if [[ -n "$address" ]]; then
+                python3 -c 'import ipaddress,sys; print(ipaddress.ip_interface(sys.argv[1]).network)' "$address"
+                return 0
+            fi
         fi
-    done < <(
-        nft -a list chain "$CHAIN_FAMILY" "$CHAIN_TABLE" "$CHAIN_NAME" |
-        awk -v prefix="$COMMENT_PREFIX-" '
-            index($0, "comment \"" prefix) {
+        sleep 1
+    done
+
+    echo "Не удалось получить IPv4-адрес интерфейса $WG_INTERFACE." >&2
+    return 1
+}
+
+rule_handles() {
+    nft -a list chain "$CHAIN_FAMILY" "$CHAIN_TABLE" "$CHAIN_NAME" |
+        awk '
+            /comment "edge-gateway-wg1-(egress|return|peer-isolation)"/ {
                 for (i = 1; i <= NF; i++) {
-                    if ($i == "handle") {
-                        print $(i + 1)
-                    }
+                    if ($i == "handle") print $(i + 1)
                 }
             }
         '
-    )
 }
 
 apply_rules() {
     wait_for_chain
 
     if [[ ! -d "/sys/class/net/$WAN_IFACE" ]]; then
-        echo "Сетевой интерфейс $WAN_IFACE не существует" >&2
-        exit 1
+        echo "Внешний интерфейс $WAN_IFACE не существует." >&2
+        return 1
     fi
 
-    remove_rules
+    WG_CIDR="$(get_wg_network)"
+    echo "WireGuard interface: $WG_INTERFACE"
+    echo "VPN network: $WG_CIDR"
+    echo "WAN interface: $WAN_IFACE"
 
-    nft add rule ip filter DOCKER-USER \
-        iifname "wg1" oifname "wg1" \
-        counter drop comment "edge-gateway-wg1-peer-isolation"
+    if ! nft -a list chain "$CHAIN_FAMILY" "$CHAIN_TABLE" "$CHAIN_NAME" | grep -F "$EGRESS_COMMENT" >/dev/null; then
+        nft insert rule "$CHAIN_FAMILY" "$CHAIN_TABLE" "$CHAIN_NAME" \
+            iifname "$WG_INTERFACE" oifname "$WAN_IFACE" \
+            ip saddr "$WG_CIDR" counter accept \
+            comment "$EGRESS_COMMENT"
+    fi
 
-    nft add rule ip filter DOCKER-USER \
-        iifname "$WAN_IFACE" oifname "wg1" \
-        ct state established,related counter accept \
-        comment "edge-gateway-wg1-return"
+    if ! nft -a list chain "$CHAIN_FAMILY" "$CHAIN_TABLE" "$CHAIN_NAME" | grep -F "$RETURN_COMMENT" >/dev/null; then
+        nft insert rule "$CHAIN_FAMILY" "$CHAIN_TABLE" "$CHAIN_NAME" \
+            iifname "$WAN_IFACE" oifname "$WG_INTERFACE" \
+            ip daddr "$WG_CIDR" ct state established,related counter accept \
+            comment "$RETURN_COMMENT"
+    fi
 
-    nft add rule ip filter DOCKER-USER \
-        iifname "wg1" oifname "$WAN_IFACE" \
-        counter accept comment "edge-gateway-wg1-egress"
+    if ! nft -a list chain "$CHAIN_FAMILY" "$CHAIN_TABLE" "$CHAIN_NAME" | grep -F "$ISOLATION_COMMENT" >/dev/null; then
+        nft insert rule "$CHAIN_FAMILY" "$CHAIN_TABLE" "$CHAIN_NAME" \
+            iifname "$WG_INTERFACE" oifname "$WG_INTERFACE" \
+            ip saddr "$WG_CIDR" ip daddr "$WG_CIDR" counter drop \
+            comment "$ISOLATION_COMMENT"
+    fi
 
-    echo "Правила edge-gateway применены."
+    echo "Все три правила edge-gateway присутствуют."
 }
 
-case "${1:-}" in
-    apply)
-        apply_rules
-        ;;
-    remove)
-        remove_rules
-        echo "Правила edge-gateway удалены."
-        ;;
+remove_rules() {
+    if ! nft list chain "$CHAIN_FAMILY" "$CHAIN_TABLE" "$CHAIN_NAME" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    while IFS= read -r handle; do
+        [[ -n "$handle" ]] || continue
+        nft delete rule "$CHAIN_FAMILY" "$CHAIN_TABLE" "$CHAIN_NAME" handle "$handle"
+    done < <(rule_handles | sort -rn)
+
+    echo "Правила edge-gateway удалены."
+}
+
+if [[ $# -eq 0 ]]; then
+    set -- apply
+fi
+
+case "$1" in
+    apply)  apply_rules ;;
+    remove) remove_rules ;;
     *)
-        echo "Использование: $0 apply|remove" >&2
+        echo "Использование: $0 {apply|remove}" >&2
         exit 2
         ;;
 esac
@@ -424,15 +460,15 @@ echo "[УСПЕХ] Этап 6.1: скрипт правил создан."
 
 ### 6.2. Создание systemd-службы
 
-Служба применяет правила после запуска Docker. При остановке Docker она удаляет только свои правила, а при последующем запуске Docker применяет их заново.
+Служба использует ту же зависимость от Docker, что и на Дубле. PartOf=docker.service обеспечивает остановку/повторный запуск службы при перезапуске Docker. При старте скрипт дождётся DOCKER-USER и появления IPv4-адреса на wg1.
 
 ~~~bash
 set -Eeuo pipefail
-trap 'rc=$?; echo "[ОШИБКА] Этап 6.2, код $rc, строка $LINENO" >&2' ERR
+trap 'rc=$?; echo "[ОШИБКА] Этап 6.2, код $rc, строка $LINENO' >&2' ERR
 
 sudo tee /etc/systemd/system/edge-gateway-nft-rules.service >/dev/null <<'EOF'
 [Unit]
-Description=Edge Gateway WireGuard forwarding and peer isolation rules
+Description=Edge Gateway IPv4 forwarding and WireGuard peer isolation rules
 Wants=docker.service
 After=docker.service
 PartOf=docker.service
@@ -442,35 +478,28 @@ Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/local/sbin/edge-gateway-nft-rules apply
 ExecStop=/usr/local/sbin/edge-gateway-nft-rules remove
+TimeoutStartSec=150
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
 sudo systemctl daemon-reload
-sudo systemctl enable --now edge-gateway-nft-rules.service
 
-sudo systemctl is-enabled --quiet edge-gateway-nft-rules.service
-sudo systemctl is-active --quiet edge-gateway-nft-rules.service
-
-sudo nft -a list chain ip filter DOCKER-USER
-
-RULE_COUNT="$(sudo nft -a list chain ip filter DOCKER-USER | grep -c 'edge-gateway-wg1-' || true)"
-if [[ "$RULE_COUNT" -ne 3 ]]; then
-    echo "[ОШИБКА] Ожидалось 3 правила edge-gateway, обнаружено: $RULE_COUNT" >&2
-    exit 1
-fi
-
-echo "[УСПЕХ] Этап 6.2: systemd-служба активна, все три правила установлены."
+echo "[УСПЕХ] Этап 6.2: скрипт и systemd-служба созданы."
+echo "Важно: службу пока НЕ включать. Это будет сделано на этапе 9.3 после первичной настройки интерфейса WG-Easy."
 ~~~
 
-Если этап завершился ошибкой, не заменяйте правила широкими ACCEPT. Сначала проверьте наличие цепочки и backend:
+До завершения мастера WG-Easy не выполняйте systemctl enable --now для этой службы: сетевого интерфейса wg1 ещё может не быть.
+
+При диагностике учитывайте, что Docker использует цепочку DOCKER-USER в режиме iptables. Ожидается backend nf_tables у iptables, как на Дубле. Не переключайте Docker на native nftables backend и не отключайте его управление iptables.
+
+Проверить backend можно так:
 
 ~~~bash
-sudo iptables --version
+iptables --version
 sudo iptables -S DOCKER-USER
 sudo systemctl status docker --no-pager
-sudo journalctl -u edge-gateway-nft-rules.service -n 100 --no-pager
 ~~~
 
 ## Этап 7. Подготовка домена и получение TLS-сертификата
@@ -704,8 +733,8 @@ https://<ДОМЕН_ПАНЕЛИ>:8080
 | Allowed IPs | 0.0.0.0/0 |
 | DNS | Те же DNS-серверы, что используются на Дубле, либо выбранные вами доверенные резолверы |
 | Generate Preshared Keys | Enabled |
-| MTU | Оставить пустым для автоматического определения |
-| Persistent Keepalive | Оставить значение по умолчанию; особое значение задавать только при необходимости для конкретного клиента |
+| MTU | 1420 |
+| Persistent Keepalive | 0 (выключено по умолчанию; для отдельных клиентов задаётся отдельно при необходимости) |
 
 Для данной конфигурации в Allowed IPs не добавлять ::/0: IPv6 в WG-Easy отключён. Значение 0.0.0.0/0 задаёт full-tunnel для IPv4-клиентов.
 
@@ -719,7 +748,7 @@ Host и Port — это публичные параметры подключен
 |---|---|
 | Port | 443 |
 | Device | Внешний интерфейс VPS, определённый на этапе 4 |
-| MTU | Оставить пустым для автоматического определения |
+| MTU | 1420 |
 | Routing Table | auto |
 | Per-Client Firewall | Не включать для воспроизведения текущей схемы Дубля |
 
@@ -733,9 +762,36 @@ VPN CIDR (адресный пул интерфейса) должен быть ч
 
 - Не включайте Prometheus/JSON metrics, если нет отдельной задачи собирать эти метрики.
 - Session Timeout можно оставить со значением по умолчанию.
-- В Hooks не добавляйте команды и не меняйте значения без отдельной необходимости.
+- В Hooks сохранить стандартные команды WG-Easy. Штатные PostUp/PostDown обеспечивают MASQUERADE для VPN-подсети, разрешение входящего UDP/443 и базовую пересылку трафика через wg1.
+- Не добавлять собственные правила NAT или дополнительные команды в Hooks: ограничения и изоляция пиров устанавливаются отдельной systemd-службой на этапе 9.3.
 
 После изменения формы нажмите **Save**. Если интерфейс предлагает отдельную перезагрузку WireGuard Interface после изменения сетевых параметров, выполните её. Клиентов на этом этапе создавать не нужно.
+
+### 9.3. Включение изоляции пиров и пересылки трафика
+
+После завершения мастера и сохранения параметров в Admin Panel вернитесь в SSH и выполните блок. Скрипт автоматически получит адрес интерфейса wg1, определит его подсеть и установит три правила с ограничением по этой подсети.
+
+~~~bash
+set -Eeuo pipefail
+trap 'rc=$?; echo "[ОШИБКА] Этап 9.3, код $rc, строка $LINENO" >&2' ERR
+
+sudo systemctl enable --now edge-gateway-nft-rules.service
+
+sudo systemctl is-enabled --quiet edge-gateway-nft-rules.service
+sudo systemctl is-active --quiet edge-gateway-nft-rules.service
+sudo nft -a list chain ip filter DOCKER-USER
+
+RULE_COUNT="$(sudo nft -a list chain ip filter DOCKER-USER | grep -c 'edge-gateway-wg1-' || true)"
+if [[ "$RULE_COUNT" -ne 3 ]]; then
+    echo "[ОШИБКА] Ожидалось 3 правила edge-gateway, обнаружено: $RULE_COUNT" >&2
+    sudo journalctl -u edge-gateway-nft-rules.service -n 100 --no-pager
+    exit 1
+fi
+
+echo "[УСПЕХ] Этап 9.3: изоляция пиров и правила пересылки включены."
+~~~
+
+Если этап завершился ошибкой, не заменяйте правила широкими ACCEPT. Проверьте наличие wg1, внешний интерфейс, backend iptables и журнал службы.
 
 Официальное руководство WG-Easy v15.5.0 по расположению этих пунктов: [Admin Panel](https://wg-easy.github.io/wg-easy/v15.5/guides/admin/).
 
