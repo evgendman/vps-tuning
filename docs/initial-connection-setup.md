@@ -934,8 +934,8 @@ if ! sudo grep -Eq '^PostUp[[:space:]]*=.*-i wg1 .*ACCEPT' "$WG_CONFIG" || \
 fi
 if ! sudo grep -Eq '^PostDown[[:space:]]*=.*MASQUERADE' "$WG_CONFIG" || \
    ! sudo grep -Eq '^PostDown[[:space:]]*=.*--dport 443' "$WG_CONFIG" || \
-   ! sudo grep -Eq '^PostDown[[:space:]]*=.*-i wg1 .* -D' "$WG_CONFIG" || \
-   ! sudo grep -Eq '^PostDown[[:space:]]*=.*-o wg1 .* -D' "$WG_CONFIG"; then
+   ! sudo grep -Eq '^PostDown[[:space:]]*=.*-D FORWARD -i wg1 .*ACCEPT' "$WG_CONFIG" || \
+   ! sudo grep -Eq '^PostDown[[:space:]]*=.*-D FORWARD -o wg1 .*ACCEPT' "$WG_CONFIG"; then
     echo "[ОШИБКА] В wg1.conf отсутствуют штатные PostDown для очистки NAT/UDP/FORWARD." >&2
     exit 1
 fi
