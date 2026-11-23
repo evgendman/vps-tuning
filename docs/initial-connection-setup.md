@@ -198,7 +198,7 @@ if [[ "$(sysctl -n net.ipv4.ip_forward)" != "1" ]]; then
     exit 1
 fi
 
-WAN_IFACE="$(ip -4 route get 1.1.1.1 | awk '{for (i=1; i<=NF; i++) if ($i=="dev") {print $(i+1); exit}}')"
+WAN_IFACE="$(ip -4 route show default | awk 'NR == 1 {for (i=1; i<=NF; i++) if ($i=="dev") {print $(i+1); exit}}' )"
 
 if [[ -z "$WAN_IFACE" || ! -d "/sys/class/net/$WAN_IFACE" ]]; then
     echo "[ОШИБКА] Не удалось определить внешний сетевой интерфейс VPS." >&2
