@@ -53,18 +53,13 @@
 
 ## Этап 1. Проверка чистой системы
 
-Выполнять в SSH-сеансе от пользователя с правами sudo. Блок проверяет ОС, архитектуру, наличие sudo и маршрут наружу. Он ничего не меняет.
+Выполнять в SSH-сеансе. Можно войти как обычный пользователь с правами sudo или как root. Если вход выполнен под root и пакет sudo отсутствует, блок установит его, поскольку последующие команды инструкции используют sudo. Далее блок проверяет ОС, архитектуру и маршрут наружу.
 
 ~~~bash
 set -Eeuo pipefail
 trap 'rc=$?; echo "[ОШИБКА] Этап 1, код $rc, строка $LINENO" >&2' ERR
 
 source /etc/os-release
-
-if [[ "$EUID" -eq 0 ]]; then
-    echo "[ОШИБКА] Запустите блок от обычного пользователя с sudo, не из root-shell." >&2
-    exit 1
-fi
 
 if [[ "$ID" != "ubuntu" || "$VERSION_ID" != "26.04" ]]; then
     echo "[ОШИБКА] Требуется Ubuntu 26.04 LTS. Обнаружено: $PRETTY_NAME" >&2
@@ -74,6 +69,18 @@ fi
 if [[ "$(dpkg --print-architecture)" != "amd64" ]]; then
     echo "[ОШИБКА] Эта инструкция рассчитана на VPS архитектуры amd64." >&2
     exit 1
+fi
+
+if [[ "$EUID" -eq 0 ]]; then
+    if ! command -v sudo >/dev/null 2>&1; then
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y sudo
+    fi
+else
+    if ! command -v sudo >/dev/null 2>&1; then
+        echo "[ОШИБКА] У пользователя нет sudo. Войдите под root и повторите этап 1." >&2
+        exit 1
+    fi
 fi
 
 sudo -v
