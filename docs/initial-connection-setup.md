@@ -117,6 +117,14 @@ sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
 
 sudo systemctl enable --now nginx
 
+if [[ -f /var/run/reboot-required ]]; then
+    echo "[ВНИМАНИЕ] После обновления ОС требуется перезагрузка:"
+    cat /var/run/reboot-required.pkgs 2>/dev/null || true
+    echo "Перезагрузите VPS командой: sudo reboot"
+    echo "После повторного подключения продолжите с этапа 3."
+    exit 0
+fi
+
 echo
 echo "Версия Nginx:"
 nginx -v
@@ -263,8 +271,6 @@ sudo docker compose --project-directory /opt/edge-gateway \
 sudo docker compose --project-directory /opt/edge-gateway \
     -f /opt/edge-gateway/compose.yaml up -d
 
-sleep 5
-
 CONTAINER_STATE="$(sudo docker inspect edge-gateway --format '{{.State.Status}}')"
 
 if [[ "$CONTAINER_STATE" != "running" ]]; then
@@ -273,9 +279,18 @@ if [[ "$CONTAINER_STATE" != "running" ]]; then
     exit 1
 fi
 
-if ! sudo ss -lntp | grep -q '127.0.0.1:51822'; then
+UI_READY=0
+for attempt in $(seq 1 60); do
+    if sudo ss -lntp | grep -q '127.0.0.1:51822'; then
+        UI_READY=1
+        break
+    fi
+    sleep 1
+done
+
+if [[ "$UI_READY" -ne 1 ]]; then
     sudo docker logs --tail 100 edge-gateway
-    echo "[ОШИБКА] Web UI не слушает 127.0.0.1:51822." >&2
+    echo "[ОШИБКА] Web UI не начал слушать 127.0.0.1:51822 за 60 секунд." >&2
     exit 1
 fi
 
@@ -492,6 +507,19 @@ echo "Важно: службу пока НЕ включать. Это будет
 
 До завершения мастера WG-Easy не выполняйте systemctl enable --now для этой службы: сетевого интерфейса wg1 ещё может не быть.
 
+Для этой схемы Docker должен использовать штатную bridge-сеть `bridge` и iptables firewall backend. Не отключайте default bridge (параметр `--bridge=none`), не задавайте `iptables=false` и не переключайте Docker на native nftables backend: в этих режимах цепочка DOCKER-USER может отсутствовать или не участвовать в пересылке.
+
+После создания скрипта проверьте, что цепочка, на которую он рассчитан, действительно создана Docker:
+
+~~~bash
+if ! sudo nft list chain ip filter DOCKER-USER >/dev/null 2>&1; then
+    echo "[ОШИБКА] Docker не создал ip filter DOCKER-USER. Проверьте default bridge и firewall backend." >&2
+    exit 1
+fi
+
+echo "[УСПЕХ] Цепочка ip filter DOCKER-USER существует."
+~~~
+
 При диагностике учитывайте, что Docker использует цепочку DOCKER-USER в режиме iptables. Ожидается backend nf_tables у iptables, как на Дубле. Не переключайте Docker на native nftables backend и не отключайте его управление iptables.
 
 Проверить backend можно так:
@@ -540,9 +568,8 @@ echo "IPv4-адреса, в которые сейчас разрешается �
 getent ahostsv4 "$DOMAIN" | awk '{print $1}' | sort -u
 
 echo
-echo "IPv6-адреса домена (если есть):"
-getent ahostsv6 "$DOMAIN" | awk '{print $1}' | sort -u || true
-echo "Если у домена есть AAAA-запись, она тоже должна указывать на этот VPS; иначе удалите её до запроса сертификата."
+echo "У этой инструкции Nginx настроен на IPv4. Если домен имеет AAAA-запись, удалите её до получения сертификата и до завершения настройки."
+echo "После изменения DNS дождитесь обновления записей."
 
 echo
 echo "Сверьте IPv4-адреса с публичным IP нового VPS."
@@ -613,6 +640,11 @@ if [[ ! "$DOMAIN" =~ $DOMAIN_RE || ! "$PANEL_USER" =~ ^[A-Za-z0-9._-]{1,64}$ ]];
     exit 1
 fi
 
+if ! sudo test -s "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" || ! sudo test -s "/etc/letsencrypt/live/$DOMAIN/privkey.pem"; then
+    echo "[ОШИБКА] Для $DOMAIN не найден сертификат. Повторите этап 7 с тем же доменом." >&2
+    exit 1
+fi
+
 if sudo test -f /etc/nginx/.htpasswd-wgeasy; then
     sudo htpasswd -B /etc/nginx/.htpasswd-wgeasy "$PANEL_USER"
 else
@@ -660,7 +692,9 @@ server {
         proxy_set_header X-Forwarded-Port  \$server_port;
         proxy_set_header X-Forwarded-Proto https;
 
-        proxy_read_timeout 300s;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 3600s;
     }
 }
 EOF
@@ -842,6 +876,12 @@ if [[ "$RULE_COUNT" -ne 3 ]]; then
     exit 1
 fi
 
+NETWORK_MODE="$(sudo docker inspect edge-gateway --format '{{.HostConfig.NetworkMode}}')"
+if [[ "$NETWORK_MODE" != "host" ]]; then
+    echo "[ОШИБКА] Контейнер должен использовать host network, обнаружено: $NETWORK_MODE" >&2
+    exit 1
+fi
+
 echo
 echo "Проверка локального Web UI:"
 sudo ss -lntp | grep '127.0.0.1:51822'
@@ -888,8 +928,18 @@ sudo systemctl is-active --quiet nginx
 sudo systemctl is-active --quiet edge-gateway-nft-rules.service
 sudo systemctl is-active --quiet certbot.timer
 
-sudo docker inspect edge-gateway --format '{{.State.Status}}'
-sudo docker exec edge-gateway wg show wg1 listen-port
+CONTAINER_STATE="$(sudo docker inspect edge-gateway --format '{{.State.Status}}')"
+if [[ "$CONTAINER_STATE" != "running" ]]; then
+    echo "[ОШИБКА] После перезагрузки контейнер edge-gateway не запущен: $CONTAINER_STATE" >&2
+    exit 1
+fi
+
+WG_PORT="$(sudo docker exec edge-gateway wg show wg1 listen-port)"
+if [[ "$WG_PORT" != "443" ]]; then
+    echo "[ОШИБКА] После перезагрузки WireGuard слушает не UDP/443, а UDP/$WG_PORT." >&2
+    exit 1
+fi
+
 sudo nft -a list chain ip filter DOCKER-USER
 
 RULE_COUNT="$(sudo nft -a list chain ip filter DOCKER-USER | grep -c 'edge-gateway-wg1-' || true)"
