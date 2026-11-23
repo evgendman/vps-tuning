@@ -113,13 +113,15 @@ sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
     certbot \
     apache2-utils \
     openssl \
-    python3
+    python3 \
+    bind9-dnsutils
 
 sudo systemctl enable --now nginx
 
 if [[ -f /var/run/reboot-required ]]; then
     echo "[ВНИМАНИЕ] После обновления ОС требуется перезагрузка:"
     cat /var/run/reboot-required.pkgs 2>/dev/null || true
+    echo "[УСПЕХ] Этап 2: пакеты установлены; перед продолжением перезагрузите VPS."
     echo "Перезагрузите VPS командой: sudo reboot"
     echo "После повторного подключения продолжите с этапа 3."
     exit 0
@@ -517,7 +519,12 @@ if ! sudo nft list chain ip filter DOCKER-USER >/dev/null 2>&1; then
     exit 1
 fi
 
-echo "[УСПЕХ] Цепочка ip filter DOCKER-USER существует."
+if ! sudo iptables -C FORWARD -j DOCKER-USER; then
+    echo "[ОШИБКА] В цепочке FORWARD отсутствует переход в DOCKER-USER. Не продолжайте настройку." >&2
+    exit 1
+fi
+
+echo "[УСПЕХ] Цепочка ip filter DOCKER-USER существует и вызывается из FORWARD."
 ~~~
 
 При диагностике учитывайте, что Docker использует цепочку DOCKER-USER в режиме iptables. Ожидается backend nf_tables у iptables, как на Дубле. Не переключайте Docker на native nftables backend и не отключайте его управление iptables.
@@ -568,8 +575,14 @@ echo "IPv4-адреса, в которые сейчас разрешается �
 getent ahostsv4 "$DOMAIN" | awk '{print $1}' | sort -u
 
 echo
-echo "У этой инструкции Nginx настроен на IPv4. Если домен имеет AAAA-запись, удалите её до получения сертификата и до завершения настройки."
-echo "После изменения DNS дождитесь обновления записей."
+echo "Проверка AAAA-записи:"
+AAAA_RECORDS="$(dig +time=3 +tries=1 +short AAAA "$DOMAIN" || true)"
+if [[ -n "$AAAA_RECORDS" ]]; then
+    echo "$AAAA_RECORDS"
+    echo "[ОШИБКА] В этой инструкции панель публикуется по IPv4. Удалите AAAA-запись домена, дождитесь обновления DNS и повторите этап 7." >&2
+    exit 1
+fi
+echo "AAAA-записей не обнаружено."
 
 echo
 echo "Сверьте IPv4-адреса с публичным IP нового VPS."
@@ -1004,5 +1017,7 @@ sudo systemctl status certbot.timer --no-pager
 - [WG-Easy v15.5.0 — Optional Configuration](https://wg-easy.github.io/wg-easy/v15.5/advanced/config/optional-config/)
 - [WG-Easy v15.5.0 — Admin Panel](https://wg-easy.github.io/wg-easy/v15.5/guides/admin/)
 - [Docker Engine — установка на Ubuntu](https://docs.docker.com/engine/install/ubuntu/)
+- [Docker — bridge networking](https://docs.docker.com/engine/network/drivers/bridge/)
+- [Docker — iptables и цепочка DOCKER-USER](https://docs.docker.com/engine/network/firewall-iptables/)
 - [Документация этого репозитория — серверная схема WG-Easy](vps-to-keenetic-via-wg-easy.md)
 - [Документация этого репозитория — HTTPS, Nginx и порт панели](vps-media-services-https.md)
